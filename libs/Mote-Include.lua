@@ -555,33 +555,28 @@ function get_melee_set()
     
     mote_vars.set_breadcrumbs:append('sets')
     mote_vars.set_breadcrumbs:append('engaged')
-	
-	-- add_to_chat(1, 'state.CombatForm.value '..state.CombatForm.value)
+
     if state.CombatForm.has_value and meleeSet[state.CombatForm.value] then
         meleeSet = meleeSet[state.CombatForm.value]
         mote_vars.set_breadcrumbs:append(state.CombatForm.value)
     end
-	
-	-- add_to_chat(1, 'state.CombatWeapon.value '..state.CombatWeapon.value)
+
     if state.CombatWeapon.has_value and meleeSet[state.CombatWeapon.value] then
         meleeSet = meleeSet[state.CombatWeapon.value]
         mote_vars.set_breadcrumbs:append(state.CombatWeapon.value)
     end
 
-	-- add_to_chat(1, 'state.OffenseMode.current '..state.OffenseMode.current)
     if meleeSet[state.OffenseMode.current] then
         meleeSet = meleeSet[state.OffenseMode.current]
         mote_vars.set_breadcrumbs:append(state.OffenseMode.current)
     end
 
-	-- add_to_chat(1, 'state.OffenseMode.current '..state.OffenseMode.current)
     if meleeSet[state.HybridMode.current] then
         meleeSet = meleeSet[state.HybridMode.current]
         mote_vars.set_breadcrumbs:append(state.HybridMode.current)
     end
-	
+
     for _,group in ipairs(classes.CustomMeleeGroups) do
-		-- add_to_chat(1, 'group '..group)
         if meleeSet[group] then
             meleeSet = meleeSet[group]
             mote_vars.set_breadcrumbs:append(group)
@@ -598,7 +593,7 @@ function get_melee_set()
     if user_customize_melee_set then
         meleeSet = user_customize_melee_set(meleeSet)
     end
-    -- add_to_chat(2, 'meleeSet '..tostring(mote_vars.set_breadcrumbs))
+
     return meleeSet
 end
 

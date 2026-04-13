@@ -212,9 +212,121 @@ function export_inv(path)
 	end
 end
 
+-- Built once per extract_sets(): basename (lowercase, no .lua) -> full path (first root wins).
+local libs_include_index = nil
+
+local function normalize_addon_path()
+	local ap = windower.addon_path:gsub('\\', '/')
+	if ap:sub(-1) ~= '/' then
+		ap = ap .. '/'
+	end
+	return ap
+end
+
+-- GearSwap libs roots, same spirit as gearswap.pathsearch (libs-dev overrides libs).
+local function closetCleaner_libs_roots()
+	local roots = {}
+	if type(gspath) == 'string' and gspath ~= '' then
+		roots[#roots + 1] = gspath .. 'libs-dev/'
+		roots[#roots + 1] = gspath .. 'libs/'
+	end
+	roots[#roots + 1] = normalize_addon_path() .. 'libs/'
+	return roots
+end
+
+local function lib_token(s)
+	return (s or ''):lower():gsub('%.lua$', '')
+end
+
+local function lib_names_match(requested, filename)
+	return lib_token(requested) == lib_token(filename)
+end
+
+-- Max .lua files per libs folder; avoids huge allocations if a path points at the wrong directory.
+local libs_scan_max_files = 400
+
+-- List *.lua basenames in a directory (prefer lfs; avoid io.popen — heavy and unstable in some clients).
+local function list_lua_files_in_dir(dir)
+	if not dir or dir == '' or not windower.dir_exists(dir) then
+		return {}
+	end
+	local t = {}
+	local ok_lfs, lfs = pcall(require, 'lfs')
+	if ok_lfs and lfs and lfs.dir then
+		for fn in lfs.dir(dir) do
+			if fn ~= '.' and fn ~= '..' and type(fn) == 'string' and fn:lower():match('%.lua$') then
+				t[#t + 1] = fn
+				if #t > libs_scan_max_files then
+					windower.add_to_chat(8, 'closetCleaner: libs folder "' .. dir .. '" has too many .lua files; ignoring scan (max ' .. libs_scan_max_files .. ')')
+					return {}
+				end
+			end
+		end
+		return t
+	end
+	local norm = dir:gsub('/', '\\')
+	if norm:sub(-1) == '\\' then
+		norm = norm:sub(1, -2)
+	end
+	local fh = io.popen(string.format('cmd /c dir /b "%s\\*.lua" 2>nul', norm))
+	if fh then
+		for line in fh:lines() do
+			line = line:gsub('\r', '')
+			if line ~= '' then
+				t[#t + 1] = line
+				if #t > libs_scan_max_files then
+					windower.add_to_chat(8, 'closetCleaner: libs folder "' .. dir .. '" has too many .lua files; ignoring scan (max ' .. libs_scan_max_files .. ')')
+					fh:close()
+					return {}
+				end
+			end
+		end
+		fh:close()
+	end
+	return t
+end
+
+local function closetCleaner_build_libs_include_index()
+	libs_include_index = {}
+	for _, root in ipairs(closetCleaner_libs_roots()) do
+		local names = list_lua_files_in_dir(root)
+		for _, name in ipairs(names) do
+			local tok = lib_token(name)
+			if tok ~= '' and libs_include_index[tok] == nil then
+				libs_include_index[tok] = root .. name
+			end
+		end
+	end
+end
+
+local function dofile_if_exists(path)
+	if path and windower.file_exists(path) then
+		dofile(path)
+		return true
+	end
+	return false
+end
+
+-- Resolve include name against libs roots: exact path, then index lookup (built once per extract_sets).
+local function include_from_libs_roots(f)
+	for _, root in ipairs(closetCleaner_libs_roots()) do
+		if dofile_if_exists(root .. f) or dofile_if_exists(root .. f .. '.lua') then
+			return true
+		end
+	end
+	if libs_include_index == nil then
+		closetCleaner_build_libs_include_index()
+	end
+	local path = libs_include_index[lib_token(f)]
+	if path and windower.file_exists(path) then
+		dofile(path)
+		return true
+	end
+	return false
+end
+
 -- Dummy include function, ignore some search known paths for others
 function include(f)
-	-- No need to do anything with this
 	if f == 'organizer-lib.lua' then
 		return
 	end
@@ -222,8 +334,8 @@ function include(f)
 		dofile(f)
 		return
 	end
-	if windower.file_exists(gspath..f) then
-		dofile(gspath..f)
+	if type(gspath) == 'string' and gspath ~= '' and windower.file_exists(gspath .. f) then
+		dofile(gspath .. f)
 		return
 	end
 	mf = gearswap.pathsearch({f})
@@ -233,17 +345,8 @@ function include(f)
 			return
 		end
 	end
-	libsFiles = { "Modes", "Mote-Include.lua", "Mote-TreasureHunter", "Mote-Mappings", "Mote-Utility", "Mote-Globals", "Mote-SelfCommands"}
-	for i,s in ipairs(libsFiles) do
-		if s == f then
-			incFile = gspath.."libs/"..f
-			if windower.file_exists(incFile) then
-				dofile(incFile)
-			else
-				dofile(incFile..".lua")
-			end
-			return
-		end
+	if include_from_libs_roots(f) then
+		return
 	end
 end
 
@@ -270,15 +373,62 @@ function copy_sets_graph(orig, seen)
 	return copy
 end
 
--- sets the 'sets' and puts them into supersets based off file name. 
-function extract_sets(file) 
-	dofile(file)
-	if get_sets ~= nil then
-		get_sets()
-	elseif init_gear_sets ~= nil then
-		init_gear_sets()
-	else
-		print('ERROR: init_gear_sets() or get_sets() not found!')
+-- Ensure common GearSwap/Mote subtables exist so init_gear_sets can assign nested keys
+-- (e.g. sets.weapons.Nuke) without "attempt to index field 'weapons' (a nil value)".
+-- Mote-Include initializes precast/midcast/idle/etc. but not sets.weapons.
+function ensure_gear_sets_baseline(s)
+	if type(s) ~= 'table' then
+		return
+	end
+	if s.precast == nil then s.precast = {} end
+	if s.precast.FC == nil then s.precast.FC = {} end
+	if s.precast.JA == nil then s.precast.JA = {} end
+	if s.precast.WS == nil then s.precast.WS = {} end
+	if s.precast.RA == nil then s.precast.RA = {} end
+	if s.midcast == nil then s.midcast = {} end
+	if s.midcast.RA == nil then s.midcast.RA = {} end
+	if s.midcast.Pet == nil then s.midcast.Pet = {} end
+	if s.idle == nil then s.idle = {} end
+	if s.resting == nil then s.resting = {} end
+	if s.engaged == nil then s.engaged = {} end
+	if s.defense == nil then s.defense = {} end
+	if s.buff == nil then s.buff = {} end
+	if s.weapons == nil then s.weapons = {} end
+end
+
+-- Load one job Lua, return a deep copy of `sets` for reporting (caller should drop reference after use).
+function extract_sets(file)
+	libs_include_index = nil
+	if type(sets) ~= 'table' then
+		sets = {}
+	end
+	ensure_gear_sets_baseline(sets)
+	local load_ok, load_err = pcall(dofile, file)
+	if not load_ok then
+		windower.add_to_chat(8, 'closetCleaner: could not load '..tostring(file)..': '..tostring(load_err))
+		return copy_sets_graph(type(sets) == 'table' and sets or {})
+	end
+	if type(sets) ~= 'table' then
+		sets = {}
+	end
+	ensure_gear_sets_baseline(sets)
+	local function run_gear_init()
+		if get_sets ~= nil then
+			get_sets()
+		elseif init_gear_sets ~= nil then
+			init_gear_sets()
+		else
+			windower.add_to_chat(8, 'closetCleaner: no init_gear_sets() or get_sets() in '..tostring(file))
+		end
+	end
+	local init_ok, init_err = pcall(run_gear_init)
+	if not init_ok then
+		windower.add_to_chat(8, 'closetCleaner: gear init failed; retrying after baseline repair: '..tostring(init_err))
+		ensure_gear_sets_baseline(sets)
+		init_ok, init_err = pcall(run_gear_init)
+		if not init_ok then
+			windower.add_to_chat(8, 'closetCleaner: gear init failed again; keeping partial sets: '..tostring(init_err))
+		end
 	end
 	return copy_sets_graph(sets or {})
 end
@@ -291,7 +441,7 @@ function export_sets(path)
 		fsets:write('=====================\n\n')
 	end
 		
-	supersets = {}
+	write_sets = T{}
 	job_used = T{}
 	job_logged = T()
 	info = {}
@@ -324,23 +474,27 @@ function export_sets(path)
 		if loadpath then
 			local ok, snapshot = pcall(extract_sets, loadpath)
 			if ok then
-				supersets[v] = snapshot
+				list_sets({ [v] = snapshot }, fsets, true)
+				snapshot = nil
 			else
 				windower.add_to_chat(123, 'closetCleaner: failed to load '..v..' ('..loadpath..'): '..tostring(snapshot))
-				supersets[v] = {}
 			end
 		end
+		collectgarbage('collect')
 	end
 	
-	list_sets( supersets , fsets ) 
+	flush_write_sets_to_gsgear(fsets)
 	if ccDebug then
 		fsets:close()
 		print("File created: "..reportName)
 	end
 end
 
-function list_sets ( t, f )  
-	write_sets = T{}
+-- If accumulate is true, merge into existing write_sets (export one job at a time to save memory).
+function list_sets(t, f, accumulate)
+	if not accumulate then
+		write_sets = T{}
+	end
 	local visited = {}
     local function sub_print_r(t,fromTab)
 		if type(t) ~= 'table' then
@@ -389,6 +543,30 @@ function list_sets ( t, f )
 		end
     end
     sub_print_r(t,nil)
+	if accumulate then
+		return
+	end
+	if ccDebug then
+		data = T{"Name", " | ", "Count", " | ", "Jobs", " | ", "Long Name"}
+		form = T{"%22s", "%3s", "%10s", "%3s", "%88s", "%3s", "%60s"}
+		print_row(f, data, form)
+		print_break(f, form)
+		f:write('\n')
+		for k,v in pairs(write_sets) do
+			data = T{res.items[k].en, " | ", tostring(v), " | ", job_used[k], " | ", res.items[k].enl}
+			print_row(f, data, form)
+			gsGear[k] = v
+		end
+		f:write()
+	else
+		for k,v in pairs(write_sets) do
+			gsGear[k] = v
+		end
+	end
+end
+
+-- After incremental list_sets(..., true) calls, write debug file and fill gsGear.
+function flush_write_sets_to_gsgear(f)
 	if ccDebug then
 		data = T{"Name", " | ", "Count", " | ", "Jobs", " | ", "Long Name"}
 		form = T{"%22s", "%3s", "%10s", "%3s", "%88s", "%3s", "%60s"}
