@@ -150,14 +150,17 @@ windower.register_event('addon command',function (...)
 		-- path = path..' '..os.clock()
 	-- end
 	
-	itemsBylongName = T{}
-	itemsByName = T{}
+	if not itemsByName then
+		itemsBylongName = T{}
+		itemsByName = T{}
+		for k,v in pairs(res.items) do
+			itemsBylongName[v.enl:lower()] = k
+			itemsByName[v.en:lower()] = k
+		end
+		collectgarbage('collect')
+	end
 	inventoryGear = T{}
 	gsGear = T{}
-	for k,v in pairs(res.items) do
-		itemsBylongName[res.items[k].enl:lower()] = k
-		itemsByName[res.items[k].en:lower()] = k
-	end
     
 	-- require 'ccConfig'
     if cmd == 'report' then
@@ -215,12 +218,40 @@ end
 -- Built once per extract_sets(): basename (lowercase, no .lua) -> full path (first root wins).
 local libs_include_index = nil
 
+local function normalize_path_slashes(p)
+	if type(p) ~= 'string' then
+		return ''
+	end
+	return (p:gsub('\\', '/'):gsub('/+', '/'))
+end
+
 local function normalize_addon_path()
-	local ap = windower.addon_path:gsub('\\', '/')
+	local ap = normalize_path_slashes(windower.addon_path)
 	if ap:sub(-1) ~= '/' then
 		ap = ap .. '/'
 	end
 	return ap
+end
+
+-- Prepend so Sel/Mote job files can require() modules shipped under GearSwap or closetCleaner libs (e.g. Snaps-RngHelper.lua).
+local function cc_gearswap_require_path_prefix()
+	local parts = {}
+	local function add_libs_subdir(base)
+		base = normalize_path_slashes(base)
+		if base == '' then
+			return
+		end
+		if base:sub(-1) ~= '/' then
+			base = base .. '/'
+		end
+		parts[#parts + 1] = base .. '?.lua'
+	end
+	if type(gspath) == 'string' and gspath ~= '' then
+		add_libs_subdir(gspath .. 'libs-dev')
+		add_libs_subdir(gspath .. 'libs')
+	end
+	add_libs_subdir(normalize_addon_path() .. 'libs')
+	return table.concat(parts, ';') .. ';'
 end
 
 -- GearSwap libs roots, same spirit as gearswap.pathsearch (libs-dev overrides libs).
@@ -299,10 +330,10 @@ local function closetCleaner_build_libs_include_index()
 	end
 end
 
-local function dofile_if_exists(path)
+-- Runs chunk if path exists; returns ok, chunk_return_values (same as loadfile/dofile contract).
+local function try_dofile(path)
 	if path and windower.file_exists(path) then
-		dofile(path)
-		return true
+		return true, dofile(path)
 	end
 	return false
 end
@@ -310,8 +341,13 @@ end
 -- Resolve include name against libs roots: exact path, then index lookup (built once per extract_sets).
 local function include_from_libs_roots(f)
 	for _, root in ipairs(closetCleaner_libs_roots()) do
-		if dofile_if_exists(root .. f) or dofile_if_exists(root .. f .. '.lua') then
-			return true
+		local ok, ret = try_dofile(root .. f)
+		if ok then
+			return ret
+		end
+		ok, ret = try_dofile(root .. f .. '.lua')
+		if ok then
+			return ret
 		end
 	end
 	if libs_include_index == nil then
@@ -319,63 +355,37 @@ local function include_from_libs_roots(f)
 	end
 	local path = libs_include_index[lib_token(f)]
 	if path and windower.file_exists(path) then
-		dofile(path)
-		return true
+		return dofile(path)
 	end
-	return false
+	return nil
 end
 
--- Dummy include function, ignore some search known paths for others
+-- Stub matches GearSwap: return value from included chunk (e.g. Snaps-Rnghelper_Config.lua returns config).
 function include(f)
-	if f == 'organizer-lib.lua' then
+	local org_key = type(f) == 'string' and f:lower():gsub('%.lua$', '') or ''
+	if org_key == 'organizer-lib' then
 		return
 	end
-	if windower.file_exists(f) then
-		dofile(f)
-		return
+	local ok, ret
+	ok, ret = try_dofile(f)
+	if ok then
+		return ret
 	end
-	if type(gspath) == 'string' and gspath ~= '' and windower.file_exists(gspath .. f) then
-		dofile(gspath .. f)
-		return
+	if type(gspath) == 'string' and gspath ~= '' then
+		ok, ret = try_dofile(gspath .. f)
+		if ok then
+			return ret
+		end
 	end
 	mf = gearswap.pathsearch({f})
-	if mf then
-		if windower.file_exists(mf) then
-			dofile(mf)
-			return
-		end
+	if mf and windower.file_exists(mf) then
+		return dofile(mf)
 	end
-	if include_from_libs_roots(f) then
-		return
-	end
+	return include_from_libs_roots(f)
 end
 
--- Deep copy of the sets table graph with cycle and shared-reference handling.
--- Metatables are not copied (avoids metatable cycles; gear data is plain tables).
-function copy_sets_graph(orig, seen)
-	seen = seen or {}
-	local ot = type(orig)
-	if ot ~= 'table' then
-		return orig
-	end
-	if seen[orig] then
-		return seen[orig]
-	end
-	local copy = {}
-	seen[orig] = copy
-	for k, v in next, orig, nil do
-		local ck = k
-		if type(k) == 'table' then
-			ck = copy_sets_graph(k, seen)
-		end
-		copy[ck] = copy_sets_graph(v, seen)
-	end
-	return copy
-end
-
--- Ensure common GearSwap/Mote subtables exist so init_gear_sets can assign nested keys
--- (e.g. sets.weapons.Nuke) without "attempt to index field 'weapons' (a nil value)".
--- Mote-Include initializes precast/midcast/idle/etc. but not sets.weapons.
+-- Ensure common GearSwap/Mote/Sel subtables exist so init_gear_sets can assign nested keys
+-- without "attempt to index field '…' (a nil value)". Informed by reference luas under data/.
 function ensure_gear_sets_baseline(s)
 	if type(s) ~= 'table' then
 		return
@@ -393,10 +403,40 @@ function ensure_gear_sets_baseline(s)
 	if s.engaged == nil then s.engaged = {} end
 	if s.defense == nil then s.defense = {} end
 	if s.buff == nil then s.buff = {} end
+	-- Very common: set_combine(sets.buff.Doom, …) as first line of init_gear_sets.
+	if s.buff.Doom == nil then s.buff.Doom = {} end
 	if s.weapons == nil then s.weapons = {} end
+	-- Sel-Include apply_passive uses sets.passive[...].
+	if s.passive == nil then s.passive = {} end
+	-- Mote-TreasureHunter / Sel jobs: set_combine(sets.TreasureHunter, …).
+	if s.TreasureHunter == nil then s.TreasureHunter = {} end
+	-- Sel crafting mode indexes sets.crafting[…].
+	if s.crafting == nil then s.crafting = {} end
+	-- SMN perpetuation sets (data/*/*_Smn_Gear.lua).
+	if s.perp == nil then s.perp = {} end
+	-- GEO/BLM style elemental wrapper tables.
+	if s.element == nil then s.element = {} end
+	-- Rare; some custom luas define aftercast sets.
+	if s.aftercast == nil then s.aftercast = {} end
 end
 
--- Load one job Lua, return a deep copy of `sets` for reporting (caller should drop reference after use).
+-- After Sel init, sets.passive is often {} with no per-mode entries; missing keys make set_combine(nil) fail.
+local function ensure_sets_passive_merge_safe(s)
+	if type(s) ~= 'table' or type(s.passive) ~= 'table' then
+		return
+	end
+	if getmetatable(s.passive) ~= nil then
+		return
+	end
+	setmetatable(s.passive, {
+		__index = function()
+			return {}
+		end,
+	})
+end
+
+-- Load one job Lua, populating the global `sets` table in-place.
+-- Returns true on success so the caller can read `sets` directly (no deep copy).
 function extract_sets(file)
 	libs_include_index = nil
 	if type(sets) ~= 'table' then
@@ -406,7 +446,7 @@ function extract_sets(file)
 	local load_ok, load_err = pcall(dofile, file)
 	if not load_ok then
 		windower.add_to_chat(8, 'closetCleaner: could not load '..tostring(file)..': '..tostring(load_err))
-		return copy_sets_graph(type(sets) == 'table' and sets or {})
+		return false
 	end
 	if type(sets) ~= 'table' then
 		sets = {}
@@ -430,10 +470,12 @@ function extract_sets(file)
 			windower.add_to_chat(8, 'closetCleaner: gear init failed again; keeping partial sets: '..tostring(init_err))
 		end
 	end
-	return copy_sets_graph(sets or {})
+	ensure_sets_passive_merge_safe(sets)
+	return true
 end
 
 function export_sets(path)
+	local saved_package_path = package.path
 	if ccDebug then
 		reportName = path..'_sets.txt'
 		fsets = io.open(reportName,'w+')
@@ -448,101 +490,133 @@ function export_sets(path)
 	gear = {}
 	gearswap.res = res
 	
-	fpath = windower.addon_path:gsub('\\','/')
-	fpath = fpath:gsub('//','/')
-	fpath = string.lower(fpath)
-	gspath = fpath:gsub('closetcleaner\/','')..'gearswap/'
-	dpath = gspath..'data/'
+	fpath = string.lower(normalize_path_slashes(windower.addon_path))
+	gspath = normalize_path_slashes(fpath:gsub('closetcleaner/', '') .. 'gearswap/')
+	if gspath ~= '' and gspath:sub(-1) ~= '/' then
+		gspath = gspath .. '/'
+	end
+	package.path = cc_gearswap_require_path_prefix() .. saved_package_path
+	dpath = gspath .. 'data/'
+	-- Resolve job file: data root first, then data/<character>/ for same names, then generic Job.lua at root.
+	local function resolve_job_lua_path(job)
+		local sub = dpath .. player.name .. '/'
+		local candidates = {
+			string.lower(dpath .. player.name .. '_' .. job .. '_gear.lua'),
+			string.lower(dpath .. player.name .. '_' .. job .. '.lua'),
+			-- Character folder: e.g. data/Smokey/Smokey_GEO_Gear.lua (then lowercase _gear fallback)
+			string.lower(sub .. player.name .. '_' .. job .. '_Gear.lua'),
+			string.lower(sub .. player.name .. '_' .. job .. '_gear.lua'),
+			string.lower(sub .. player.name .. '_' .. job .. '.lua'),
+			string.lower(dpath .. job .. '_gear.lua'),
+			string.lower(dpath .. job .. '.lua'),
+		}
+		for _, p in ipairs(candidates) do
+			if windower.file_exists(p) then
+				return p
+			end
+		end
+		return nil
+	end
+	-- Snapshot package.loaded so we can evict modules loaded by each job file.
+	local base_loaded = {}
+	for k in pairs(package.loaded) do base_loaded[k] = true end
+
 	for i,v in ipairs(ccjobs) do
 		sets = {}
-		lname = string.lower(dpath..player.name..'_'..v..'.lua')
-		lgname = string.lower(dpath..player.name..'_'..v..'_gear.lua')
-		sname = string.lower(dpath..v..'.lua')
-		sgname = string.lower(dpath..v..'_gear.lua')
-		local loadpath
-		if windower.file_exists(lgname) then
-			loadpath = lgname
-		elseif windower.file_exists(lname) then
-			loadpath = lname
-		elseif windower.file_exists(sgname) then
-			loadpath = sgname
-		elseif windower.file_exists(sname) then
-			loadpath = sname
-		else
-		   print('lua file for '..v..' not found!')
+		local loadpath = resolve_job_lua_path(v)
+		if not loadpath then
+			print('lua file for '..v..' not found!')
 		end
 		if loadpath then
-			local ok, snapshot = pcall(extract_sets, loadpath)
-			if ok then
-				list_sets({ [v] = snapshot }, fsets, true)
-				snapshot = nil
-			else
-				windower.add_to_chat(123, 'closetCleaner: failed to load '..v..' ('..loadpath..'): '..tostring(snapshot))
+			local ok, result = pcall(extract_sets, loadpath)
+			if ok and result then
+				list_sets(sets, fsets, true, v)
+			elseif not ok then
+				windower.add_to_chat(123, 'closetCleaner: failed to load '..v..' ('..loadpath..'): '..tostring(result))
+			end
+		end
+		-- Release the sets graph and common globals job files define.
+		sets = nil
+		get_sets = nil
+		init_gear_sets = nil
+		job_setup = nil
+		user_setup = nil
+		-- Evict modules that this job file pulled in to free their tables.
+		for k in pairs(package.loaded) do
+			if not base_loaded[k] then
+				package.loaded[k] = nil
 			end
 		end
 		collectgarbage('collect')
 	end
 	
+	libs_include_index = nil
 	flush_write_sets_to_gsgear(fsets)
 	if ccDebug then
 		fsets:close()
 		print("File created: "..reportName)
 	end
+	package.path = saved_package_path
 end
 
 -- If accumulate is true, merge into existing write_sets (export one job at a time to save memory).
-function list_sets(t, f, accumulate)
+-- default_job: ccjobs abbrev for this snapshot (avoids nil if tree omits a recognized job key).
+function list_sets(t, f, accumulate, default_job)
 	if not accumulate then
 		write_sets = T{}
 	end
 	local visited = {}
-    local function sub_print_r(t,fromTab)
-		if type(t) ~= 'table' then
+	local job_abbr = S{'WAR', 'MNK', 'WHM', 'BLM', 'RDM', 'THF', 'PLD', 'DRK', 'BST', 'BRD', 'RNG', 'SAM', 'NIN', 'DRG', 'SMN', 'BLU', 'COR', 'PUP', 'DNC', 'SCH', 'GEO', 'RUN'}
+	local gear_slots = S{'name', 'main', 'sub', 'range', 'ammo', 'head', 'neck', 'left_ear', 'right_ear', 'body', 'hands', 'left_ring', 'right_ring', 'back', 'waist', 'legs', 'feet', 'ear1', 'ear2', 'ring1', 'ring2', 'lear', 'rear', 'lring', 'rring'}
+	local function sub_print_r(node, cur_job)
+		if type(node) ~= 'table' then
 			return
 		end
-		if visited[t] then
+		if visited[node] then
 			return
 		end
-		visited[t] = true
-		for pos,val in pairs(t) do
-			if S{"WAR", "MNK", "WHM", "BLM", "RDM", "THF", "PLD", "DRK", "BST", "BRD", "RNG", "SAM", "NIN", "DRG", "SMN", "BLU", "COR", "PUP", "DNC", "SCH", "GEO", "RUN"}:contains(pos) then
-				job = pos
+		visited[node] = true
+		for pos, val in pairs(node) do
+			local j = cur_job
+			if job_abbr:contains(pos) then
+				j = pos
 			end
 			if type(val) == 'table' then
-				sub_print_r(val,job)
+				sub_print_r(val, j)
 			elseif type(val) == 'string' then
-				if val ~= "" and val ~= "empty" then 
-					if S{"name", "main", "sub", "range", "ammo", "head", "neck", "left_ear", "right_ear", "body", "hands", "left_ring", "right_ring", "back", "waist", "legs", "feet", "ear1", "ear2", "ring1", "ring2", "lear", "rear", "lring", "rring"}:contains(pos) then
+				if val ~= '' and val ~= 'empty' then
+					if gear_slots:contains(pos) then
 						local resolved = itemsByName[val:lower()] or itemsBylongName[val:lower()]
 						if resolved == nil then
-							print("Item: '"..val.."' not found in resources! "..pos)
+							print("Item: '" .. val .. "' not found in resources! " .. tostring(pos))
 						else
 							itemid = resolved
+							local jk = j or default_job or '?'
 							if write_sets[itemid] == nil then
 								write_sets[itemid] = 1
 								if job_used[itemid] == nil then
-									job_used[itemid] = job
-									job_logged[itemid..job] = 1
+									job_used[itemid] = jk
+									job_logged[itemid .. jk] = 1
 								else
-									job_used[itemid] = job_used[itemid]..","..job
-									job_logged[itemid..job] = 1
+									job_used[itemid] = job_used[itemid] .. ',' .. jk
+									job_logged[itemid .. jk] = 1
 								end
-							else	
+							else
 								write_sets[itemid] = write_sets[itemid] + 1
-								if job_logged[itemid..job] == nil then
-									job_used[itemid] = job_used[itemid]..","..job
-									job_logged[itemid..job] = 1
+								if job_logged[itemid .. jk] == nil then
+									job_used[itemid] = job_used[itemid] .. ',' .. jk
+									job_logged[itemid .. jk] = 1
 								end
 							end
 						end
 					end
 				end
 			else
-				print("Error: Val needs to be table or string")
+				print('Error: Val needs to be table or string')
 			end
 		end
-    end
-    sub_print_r(t,nil)
+	end
+	sub_print_r(t, default_job)
 	if accumulate then
 		return
 	end
@@ -691,21 +765,6 @@ function spairs(t, order)
     end
 end
 
-function deepcopy(orig)
-    local orig_type = type(orig)
-    local copy
-    if orig_type == 'table' then
-        copy = {}
-        for orig_key, orig_value in next, orig, nil do
-            copy[deepcopy(orig_key)] = deepcopy(orig_value)
-        end
-        setmetatable(copy, deepcopy(getmetatable(orig)))
-    else -- number, string, boolean, etc
-        copy = orig
-    end
-    return copy
-end
-
 function gearswap.pathsearch(files_list)
 
     -- base directory search order:
@@ -778,6 +837,10 @@ end
 --dummy functions
 function send_command(c)
 	windower.send_command(c)
+end
+
+-- GearSwap hook for addon commands; not used when parsing sets for reports.
+function register_unhandled_command(func)
 end
 
 function windower.register_event(c)
