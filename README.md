@@ -1,4 +1,4 @@
-Author: Brimstone
+Original Author: Brimstone
 
 addon: closetCleaner
 

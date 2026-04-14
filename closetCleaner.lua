@@ -1,6 +1,6 @@
 _addon.name = 'closetCleaner'
-_addon.version = '0.7'
-_addon.author = 'Brimstone'
+_addon.version = '0.8'
+_addon.author = 'Brimstone, Gol-Exe'
 _addon.commands = {'cc','closetCleaner'}
 
 if windower.file_exists(windower.addon_path..'data/bootstrap.lua') then
