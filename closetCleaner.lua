@@ -521,6 +521,11 @@ function export_sets(path)
 	local base_loaded = {}
 	for k in pairs(package.loaded) do base_loaded[k] = true end
 
+	-- Stub coroutine.schedule so include files (e.g. Mirdain-Include) don't
+	-- schedule delayed callbacks that fire after we nil out `sets`.
+	local saved_coroutine_schedule = coroutine.schedule
+	coroutine.schedule = function() end
+
 	for i,v in ipairs(ccjobs) do
 		sets = {}
 		local loadpath = resolve_job_lua_path(v)
@@ -550,6 +555,8 @@ function export_sets(path)
 		collectgarbage('collect')
 	end
 	
+	coroutine.schedule = saved_coroutine_schedule
+
 	libs_include_index = nil
 	flush_write_sets_to_gsgear(fsets)
 	if ccDebug then
